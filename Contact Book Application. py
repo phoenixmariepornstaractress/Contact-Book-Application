@@ -1,0 +1,276 @@
+import sys
+import csv
+import mysql.connector
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+    QLineEdit, QPushButton, QTableWidget, QTableWidgetItem,
+    QMessageBox, QInputDialog, QFileDialog, QComboBox
+)
+from PyQt5.QtCore import Qt
+
+
+class ContactDB:
+    def __init__(self):
+        try:
+            self.conn = mysql.connector.connect(
+                host="localhost",
+                user="root",
+                password="password",
+                database="contactbook"
+            )
+            self.cursor = self.conn.cursor()
+            self.cursor.execute("""
+                CREATE TABLE IF NOT EXISTS contacts (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    name VARCHAR(255),
+                    phone VARCHAR(255),
+                    category VARCHAR(255)
+                )
+            """)
+            self.conn.commit()
+        except mysql.connector.Error as err:
+            raise ConnectionError(f"Database connection failed: {err}")
+
+    def fetch_contacts(self, search_term=None):
+        try:
+            if search_term:
+                self.cursor.execute("""
+                    SELECT id, name, phone, category FROM contacts
+                    WHERE name LIKE %s OR phone LIKE %s OR category LIKE %s
+                """, (f"%{search_term}%", f"%{search_term}%", f"%{search_term}%"))
+            else:
+                self.cursor.execute("SELECT id, name, phone, category FROM contacts")
+            return self.cursor.fetchall()
+        except mysql.connector.Error as err:
+            raise RuntimeError(f"Failed to fetch contacts: {err}")
+
+    def add_contact(self, name, phone, category):
+        try:
+            self.cursor.execute("INSERT INTO contacts (name, phone, category) VALUES (%s, %s, %s)", (name, phone, category))
+            self.conn.commit()
+        except mysql.connector.Error as err:
+            raise RuntimeError(f"Failed to add contact: {err}")
+
+    def update_contact(self, contact_id, name, phone, category):
+        try:
+            self.cursor.execute("""
+                UPDATE contacts SET name=%s, phone=%s, category=%s WHERE id=%s
+            """, (name, phone, category, contact_id))
+            self.conn.commit()
+        except mysql.connector.Error as err:
+            raise RuntimeError(f"Failed to update contact: {err}")
+
+    def delete_contact(self, contact_id):
+        try:
+            self.cursor.execute("DELETE FROM contacts WHERE id=%s", (contact_id,))
+            self.conn.commit()
+        except mysql.connector.Error as err:
+            raise RuntimeError(f"Failed to delete contact: {err}")
+
+    def close(self):
+        self.cursor.close()
+        self.conn.close()
+
+
+class ContactBookUI(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Professional Contact Book")
+        self.setGeometry(100, 100, 600, 500)
+
+        try:
+            self.db = ContactDB()
+        except ConnectionError as e:
+            QMessageBox.critical(self, "Database Error", str(e))
+            sys.exit(1)
+
+        self.initUI()
+        self.loadContacts()
+
+    def initUI(self):
+        self.setStyleSheet("""
+            QWidget { background-color: #f8f9fa; font-family: Segoe UI; }
+            QPushButton {
+                background-color: #0077b6; color: white;
+                padding: 6px 10px; border-radius: 4px;
+            }
+            QPushButton:hover { background-color: #0096c7; }
+            QLineEdit, QComboBox {
+                padding: 6px; border: 1px solid #ccc;
+                border-radius: 4px;
+            }
+            QTableWidget {
+                background-color: #ffffff; border: 1px solid #ccc;
+                border-radius: 4px;
+            }
+        """)
+
+        layout = QVBoxLayout()
+
+        self.name_input = QLineEdit()
+        self.name_input.setPlaceholderText("Name")
+        self.phone_input = QLineEdit()
+        self.phone_input.setPlaceholderText("Phone Number")
+        self.category_input = QComboBox()
+        self.category_input.addItems(["Family", "Friends", "Work", "Other"])
+
+        layout.addWidget(self.name_input)
+        layout.addWidget(self.phone_input)
+        layout.addWidget(self.category_input)
+
+        button_layout = QHBoxLayout()
+        self.add_btn = QPushButton("Add")
+        self.update_btn = QPushButton("Update")
+        self.delete_btn = QPushButton("Delete")
+        self.search_btn = QPushButton("Search")
+        self.export_btn = QPushButton("Export")
+        self.import_btn = QPushButton("Import")
+        self.help_btn = QPushButton("Help")
+
+        for btn in [self.add_btn, self.update_btn, self.delete_btn, self.search_btn, self.export_btn, self.import_btn, self.help_btn]:
+            button_layout.addWidget(btn)
+        layout.addLayout(button_layout)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(["ID", "Name", "Phone", "Category"])
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        layout.addWidget(self.table)
+
+        self.setLayout(layout)
+
+        self.add_btn.clicked.connect(self.addContact)
+        self.update_btn.clicked.connect(self.updateContact)
+        self.delete_btn.clicked.connect(self.deleteContact)
+        self.search_btn.clicked.connect(self.searchContact)
+        self.export_btn.clicked.connect(self.exportContacts)
+        self.import_btn.clicked.connect(self.importContacts)
+        self.help_btn.clicked.connect(self.showHelp)
+
+    def loadContacts(self, search_term=None):
+        self.table.setRowCount(0)
+        try:
+            contacts = self.db.fetch_contacts(search_term)
+            for row_idx, (cid, name, phone, category) in enumerate(contacts):
+                self.table.insertRow(row_idx)
+                self.table.setItem(row_idx, 0, QTableWidgetItem(str(cid)))
+                self.table.setItem(row_idx, 1, QTableWidgetItem(name))
+                self.table.setItem(row_idx, 2, QTableWidgetItem(phone))
+                self.table.setItem(row_idx, 3, QTableWidgetItem(category))
+        except Exception as e:
+            QMessageBox.critical(self, "Load Error", str(e))
+
+    def getSelectedRowData(self):
+        row = self.table.currentRow()
+        if row != -1:
+            contact_id = int(self.table.item(row, 0).text())
+            name = self.table.item(row, 1).text()
+            phone = self.table.item(row, 2).text()
+            category = self.table.item(row, 3).text()
+            return contact_id, name, phone, category
+        return None
+
+    def addContact(self):
+        name = self.name_input.text().strip()
+        phone = self.phone_input.text().strip()
+        category = self.category_input.currentText()
+        if name and phone:
+            try:
+                self.db.add_contact(name, phone, category)
+                self.loadContacts()
+                self.name_input.clear()
+                self.phone_input.clear()
+                QMessageBox.information(self, "Success", "Contact added.")
+            except Exception as e:
+                QMessageBox.critical(self, "Add Error", str(e))
+        else:
+            QMessageBox.warning(self, "Input Error", "Name and phone number are required.")
+
+    def updateContact(self):
+        data = self.getSelectedRowData()
+        if data:
+            contact_id, name, phone, category = data
+            new_name, ok1 = QInputDialog.getText(self, "Update", "Name:", text=name)
+            if ok1:
+                new_phone, ok2 = QInputDialog.getText(self, "Update", "Phone:", text=phone)
+                if ok2:
+                    new_category, ok3 = QInputDialog.getText(self, "Update", "Category:", text=category)
+                    if ok3:
+                        try:
+                            self.db.update_contact(contact_id, new_name, new_phone, new_category)
+                            self.loadContacts()
+                            QMessageBox.information(self, "Updated", "Contact updated.")
+                        except Exception as e:
+                            QMessageBox.critical(self, "Update Error", str(e))
+        else:
+            QMessageBox.warning(self, "No Selection", "Select a contact to update.")
+
+    def deleteContact(self):
+        data = self.getSelectedRowData()
+        if data:
+            contact_id, name, *_ = data
+            confirm = QMessageBox.question(self, "Delete", f"Delete '{name}'?", QMessageBox.Yes | QMessageBox.No)
+            if confirm == QMessageBox.Yes:
+                try:
+                    self.db.delete_contact(contact_id)
+                    self.loadContacts()
+                    QMessageBox.information(self, "Deleted", "Contact deleted.")
+                except Exception as e:
+                    QMessageBox.critical(self, "Delete Error", str(e))
+        else:
+            QMessageBox.warning(self, "No Selection", "Select a contact to delete.")
+
+    def searchContact(self):
+        query, ok = QInputDialog.getText(self, "Search", "Enter keyword:")
+        if ok and query:
+            self.loadContacts(query)
+
+    def exportContacts(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Export Contacts", "contacts.csv", "CSV Files (*.csv)")
+        if path:
+            try:
+                with open(path, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(['ID', 'Name', 'Phone', 'Category'])
+                    for cid, name, phone, category in self.db.fetch_contacts():
+                        writer.writerow([cid, name, phone, category])
+                QMessageBox.information(self, "Export", "Contacts exported.")
+            except Exception as e:
+                QMessageBox.critical(self, "Export Error", str(e))
+
+    def importContacts(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Import Contacts", "", "CSV Files (*.csv)")
+        if path:
+            try:
+                with open(path, 'r', newline='', encoding='utf-8') as f:
+                    reader = csv.reader(f)
+                    next(reader)
+                    for row in reader:
+                        if len(row) >= 3:
+                            name, phone, category = row[1], row[2], row[3] if len(row) > 3 else "Other"
+                            self.db.add_contact(name, phone, category)
+                    self.loadContacts()
+                QMessageBox.information(self, "Import", "Contacts imported.")
+            except Exception as e:
+                QMessageBox.critical(self, "Import Error", str(e))
+
+    def showHelp(self):
+        QMessageBox.information(self, "Help", (
+            "- Add: Enter name, phone, category and click Add.\n"
+            "- Update: Select a contact and click Update.\n"
+            "- Delete: Select a contact and click Delete.\n"
+            "- Search: Click Search to find contacts.\n"
+            "- Export: Save contacts to CSV.\n"
+            "- Import: Load contacts from CSV."
+        ))
+
+    def closeEvent(self, event):
+        self.db.close()
+        event.accept()
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = ContactBookUI()
+    window.show()
+    sys.exit(app.exec_())

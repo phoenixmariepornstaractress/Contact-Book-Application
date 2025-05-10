@@ -1,0 +1,16 @@
+-- Create the database
+CREATE DATABASE ContactBook;
+GO
+
+-- Use the database
+USE ContactBook;
+GO
+
+-- Create the contacts table
+CREATE TABLE contacts (
+    id INT IDENTITY(1,1) PRIMARY KEY,
+    name NVARCHAR(255) NOT NULL,
+    phone NVARCHAR(255) NOT NULL,
+    category NVARCHAR(255) NOT NULL
+);
+GO
