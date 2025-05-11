@@ -33,7 +33,7 @@ A modern contact management desktop application built using **Python**, **PyQt5*
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/yourusername/contact-book-app.git
+   git clone https://github.com/phoenixmariepornstaractress/contact-book-app.git
    cd contact-book-app
    ```
 
