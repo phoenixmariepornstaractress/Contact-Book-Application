@@ -1,16 +1,62 @@
--- Create the database
-CREATE DATABASE ContactBook;
-GO
+-- =============================================
+-- Professional Contact Manager Pro
+-- Database Creation & Schema
+-- Version: 2.1
+-- =============================================
+
+-- Create the database (if it doesn't exist)
+CREATE DATABASE IF NOT EXISTS contactbook
+    CHARACTER SET utf8mb4
+    COLLATE utf8mb4_unicode_ci;
 
 -- Use the database
-USE ContactBook;
-GO
+USE contactbook;
 
--- Create the contacts table
+-- Drop the table if exists (optional, for clean reinstall)
+-- DROP TABLE IF EXISTS contacts;
+
+-- Create the main contacts table with best practices
 CREATE TABLE contacts (
-    id INT IDENTITY(1,1) PRIMARY KEY,
-    name NVARCHAR(255) NOT NULL,
-    phone NVARCHAR(255) NOT NULL,
-    category NVARCHAR(255) NOT NULL
-);
-GO
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    name        VARCHAR(255) NOT NULL,
+    phone       VARCHAR(50)  NOT NULL UNIQUE,
+    
+    -- Standardized category with common business/personal options
+    category    ENUM(
+        'Family', 'Friends', 'Work', 'Business', 
+        'Client', 'Supplier', 'Colleague', 'Partner', 'Other'
+    ) DEFAULT 'Other',
+    
+    email       VARCHAR(255) NULL,
+    notes       TEXT NULL,
+    
+    -- Automatic timestamps
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    
+    -- Indexes for performance
+    INDEX idx_name (name),
+    INDEX idx_phone (phone),
+    INDEX idx_category (category),
+    INDEX idx_email (email),
+    INDEX idx_created (created_at)
+) ENGINE=InnoDB 
+  DEFAULT CHARSET=utf8mb4 
+  COLLATE=utf8mb4_unicode_ci;
+
+-- Optional: Insert sample data for first-time users
+INSERT IGNORE INTO contacts (name, phone, category, email, notes) VALUES
+('John Doe', '5551234567', 'Work', 'john.doe@example.com', 'Lead developer - Project Alpha'),
+('Jane Smith', '5559876543', 'Client', 'jane@acme.com', 'Primary contact for Acme Corp'),
+('Family Doctor', '5557418529', 'Family', 'dr.lee@clinic.com', 'Dr. Sarah Lee - Annual checkup due'),
+('Tech Support', '8005550199', 'Business', NULL, 'Vendor support line');
+
+-- Grant privileges (adjust user as needed)
+-- GRANT ALL PRIVILEGES ON contactbook.* TO 'root'@'localhost';
+-- FLUSH PRIVILEGES;
+
+-- Show confirmation
+SELECT 
+    'Database "contactbook" and table "contacts" created successfully!' AS Status,
+    COUNT(*) AS Sample_Records_Inserted
+FROM contacts;
