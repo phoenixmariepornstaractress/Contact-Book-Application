@@ -1,276 +1,534 @@
 import sys
 import csv
+import os
+import re
+import subprocess
+from pathlib import Path
+from datetime import datetime
 import mysql.connector
+from mysql.connector import errors as mysql_errors
 from PyQt5.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QLineEdit, QPushButton, QTableWidget, QTableWidgetItem,
-    QMessageBox, QInputDialog, QFileDialog, QComboBox
+    QApplication, QWidget, QHBoxLayout, QVBoxLayout, QFormLayout,
+    QGroupBox, QLineEdit, QPushButton, QTableWidget, QTableWidgetItem,
+    QMessageBox, QFileDialog, QComboBox, QHeaderView, QAbstractItemView,
+    QProgressDialog, QStatusBar, QMenuBar, QAction, QInputDialog,
+    QShortcut
 )
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QSettings, QTimer, QDateTime, QKeySequence
+from PyQt5.QtGui import QIcon
 
 
 class ContactDB:
     def __init__(self):
         try:
             self.conn = mysql.connector.connect(
-                host="localhost",
-                user="root",
-                password="password",
-                database="contactbook"
+                host=os.getenv("DB_HOST", "localhost"),
+                user=os.getenv("DB_USER", "root"),
+                password=os.getenv("DB_PASSWORD", "password"),
+                database=os.getenv("DB_NAME", "contactbook"),
+                autocommit=True
             )
             self.cursor = self.conn.cursor()
             self.cursor.execute("""
                 CREATE TABLE IF NOT EXISTS contacts (
                     id INT AUTO_INCREMENT PRIMARY KEY,
-                    name VARCHAR(255),
-                    phone VARCHAR(255),
-                    category VARCHAR(255)
+                    name VARCHAR(255) NOT NULL,
+                    phone VARCHAR(50) NOT NULL UNIQUE,
+                    category VARCHAR(100) DEFAULT 'Other',
+                    email VARCHAR(255),
+                    notes TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
                 )
             """)
-            self.conn.commit()
         except mysql.connector.Error as err:
-            raise ConnectionError(f"Database connection failed: {err}")
+            raise ConnectionError(f"Failed to connect to database: {err}")
 
     def fetch_contacts(self, search_term=None):
-        try:
-            if search_term:
-                self.cursor.execute("""
-                    SELECT id, name, phone, category FROM contacts
-                    WHERE name LIKE %s OR phone LIKE %s OR category LIKE %s
-                """, (f"%{search_term}%", f"%{search_term}%", f"%{search_term}%"))
-            else:
-                self.cursor.execute("SELECT id, name, phone, category FROM contacts")
-            return self.cursor.fetchall()
-        except mysql.connector.Error as err:
-            raise RuntimeError(f"Failed to fetch contacts: {err}")
+        query = """
+            SELECT id, name, phone, category, email, notes, created_at 
+            FROM contacts
+            WHERE name LIKE %s OR phone LIKE %s OR category LIKE %s OR email LIKE %s
+            ORDER BY name
+        """
+        like_term = f"%{search_term}%" if search_term else "%"
+        self.cursor.execute(query, (like_term, like_term, like_term, like_term))
+        return self.cursor.fetchall()
 
-    def add_contact(self, name, phone, category):
+    def add_contact(self, name, phone, category, email="", notes=""):
         try:
-            self.cursor.execute("INSERT INTO contacts (name, phone, category) VALUES (%s, %s, %s)", (name, phone, category))
-            self.conn.commit()
-        except mysql.connector.Error as err:
-            raise RuntimeError(f"Failed to add contact: {err}")
+            self.cursor.execute(
+                "INSERT INTO contacts (name, phone, category, email, notes) VALUES (%s, %s, %s, %s, %s)",
+                (name.strip(), phone.strip(), category, email.strip() if email else None, notes.strip() if notes else None)
+            )
+            return True
+        except mysql_errors.IntegrityError:
+            return False
 
-    def update_contact(self, contact_id, name, phone, category):
+    def update_contact(self, contact_id, name, phone, category, email="", notes=""):
         try:
-            self.cursor.execute("""
-                UPDATE contacts SET name=%s, phone=%s, category=%s WHERE id=%s
-            """, (name, phone, category, contact_id))
-            self.conn.commit()
-        except mysql.connector.Error as err:
-            raise RuntimeError(f"Failed to update contact: {err}")
+            self.cursor.execute(
+                """UPDATE contacts SET name=%s, phone=%s, category=%s, email=%s, notes=%s 
+                   WHERE id=%s""",
+                (name.strip(), phone.strip(), category, email.strip() if email else None, notes.strip() if notes else None, contact_id)
+            )
+            return self.cursor.rowcount > 0
+        except mysql_errors.IntegrityError:
+            return False
 
     def delete_contact(self, contact_id):
-        try:
-            self.cursor.execute("DELETE FROM contacts WHERE id=%s", (contact_id,))
-            self.conn.commit()
-        except mysql.connector.Error as err:
-            raise RuntimeError(f"Failed to delete contact: {err}")
+        self.cursor.execute("DELETE FROM contacts WHERE id=%s", (contact_id,))
+
+    def get_statistics(self):
+        self.cursor.execute("SELECT COUNT(*) FROM contacts")
+        total = self.cursor.fetchone()[0]
+        self.cursor.execute("SELECT category, COUNT(*) FROM contacts GROUP BY category")
+        by_category = dict(self.cursor.fetchall() or [])
+        return total, by_category
+
+    def truncate_table(self):
+        self.cursor.execute("TRUNCATE TABLE contacts")
 
     def close(self):
-        self.cursor.close()
-        self.conn.close()
+        if hasattr(self, 'cursor') and self.cursor:
+            self.cursor.close()
+        if hasattr(self, 'conn') and self.conn.is_connected():
+            self.conn.close()
 
 
 class ContactBookUI(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Professional Contact Book")
-        self.setGeometry(100, 100, 600, 500)
+        self.setWindowTitle("Professional Contact Manager Pro")
+        self.setWindowIcon(QIcon.fromTheme("address-book-new"))
+        self.settings = QSettings("MyCompany", "ContactManagerPro")
+        self.db = None
+        self.selected_id = None
+
+        # Restore window state
+        geometry = self.settings.value("geometry")
+        if geometry:
+            self.restoreGeometry(geometry)
+        self.is_dark_mode = self.settings.value("dark_mode", False, type=bool)
 
         try:
             self.db = ContactDB()
         except ConnectionError as e:
-            QMessageBox.critical(self, "Database Error", str(e))
+            QMessageBox.critical(None, "Database Error", str(e))
             sys.exit(1)
 
         self.initUI()
+        self.applyTheme()
         self.loadContacts()
+        self.updateStatus("Ready")
 
     def initUI(self):
-        self.setStyleSheet("""
-            QWidget { background-color: #f8f9fa; font-family: Segoe UI; }
-            QPushButton {
-                background-color: #0077b6; color: white;
-                padding: 6px 10px; border-radius: 4px;
-            }
-            QPushButton:hover { background-color: #0096c7; }
-            QLineEdit, QComboBox {
-                padding: 6px; border: 1px solid #ccc;
-                border-radius: 4px;
-            }
-            QTableWidget {
-                background-color: #ffffff; border: 1px solid #ccc;
-                border-radius: 4px;
-            }
-        """)
+        self.setMinimumSize(1150, 720)
 
-        layout = QVBoxLayout()
+        # Menu Bar
+        menubar = QMenuBar(self)
+        file_menu = menubar.addMenu("&File")
+        view_menu = menubar.addMenu("&View")
+        tools_menu = menubar.addMenu("&Tools")
+        help_menu = menubar.addMenu("&Help")
+
+        file_menu.addAction("Export CSV", self.exportContacts, QKeySequence("Ctrl+E"))
+        file_menu.addAction("Import CSV", self.importContacts, QKeySequence("Ctrl+I"))
+        file_menu.addSeparator()
+        file_menu.addAction("Backup Database", self.backupDatabase)
+        file_menu.addAction("Exit", self.close, QKeySequence("Ctrl+Q"))
+
+        theme_action = QAction("Dark Mode", self, checkable=True)
+        theme_action.setChecked(self.is_dark_mode)
+        theme_action.triggered.connect(self.toggleTheme)
+        view_menu.addAction(theme_action)
+
+        tools_menu.addAction("Statistics", self.showStatistics)
+        tools_menu.addAction("Clear All Contacts", self.clearAllContacts)
+
+        help_menu.addAction("Help", self.showHelp)
+        help_menu.addAction("About", self.showAbout)
+
+        main_layout = QVBoxLayout()
+        main_layout.setMenuBar(menubar)
+        main_layout.setSpacing(10)
+        main_layout.setContentsMargins(10, 10, 10, 10)
+
+        content_layout = QHBoxLayout()
+
+        # Left Panel
+        form_group = QGroupBox("Contact Information")
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignRight)
 
         self.name_input = QLineEdit()
-        self.name_input.setPlaceholderText("Name")
         self.phone_input = QLineEdit()
-        self.phone_input.setPlaceholderText("Phone Number")
-        self.category_input = QComboBox()
-        self.category_input.addItems(["Family", "Friends", "Work", "Other"])
+        self.phone_input.setPlaceholderText("(555) 123-4567")
+        self.email_input = QLineEdit()
+        self.email_input.setPlaceholderText("john@example.com")
+        self.category_combo = QComboBox()
+        self.category_combo.addItems([
+            "Family", "Friends", "Work", "Business", "Client",
+            "Supplier", "Colleague", "Partner", "Other"
+        ])
+        self.notes_input = QLineEdit()
+        self.notes_input.setPlaceholderText("Optional notes...")
 
-        layout.addWidget(self.name_input)
-        layout.addWidget(self.phone_input)
-        layout.addWidget(self.category_input)
+        form.addRow("Name *:", self.name_input)
+        form.addRow("Phone *:", self.phone_input)
+        form.addRow("Email:", self.email_input)
+        form.addRow("Category:", self.category_combo)
+        form.addRow("Notes:", self.notes_input)
+        form_group.setLayout(form)
 
-        button_layout = QHBoxLayout()
-        self.add_btn = QPushButton("Add")
-        self.update_btn = QPushButton("Update")
-        self.delete_btn = QPushButton("Delete")
+        btn_layout = QVBoxLayout()
+        self.add_btn = QPushButton("Add Contact")
+        self.update_btn = QPushButton("Update Contact")
+        self.delete_btn = QPushButton("Delete Contact")
+        self.clear_btn = QPushButton("Clear Form")
+
+        for btn in (self.add_btn, self.update_btn, self.delete_btn, self.clear_btn):
+            btn.setMinimumHeight(42)
+            btn_layout.addWidget(btn)
+        btn_layout.addStretch()
+
+        search_layout = QHBoxLayout()
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Search contacts...")
         self.search_btn = QPushButton("Search")
-        self.export_btn = QPushButton("Export")
-        self.import_btn = QPushButton("Import")
-        self.help_btn = QPushButton("Help")
+        search_layout.addWidget(self.search_input)
+        search_layout.addWidget(self.search_btn)
 
-        for btn in [self.add_btn, self.update_btn, self.delete_btn, self.search_btn, self.export_btn, self.import_btn, self.help_btn]:
-            button_layout.addWidget(btn)
-        layout.addLayout(button_layout)
+        action_layout = QHBoxLayout()
+        self.export_btn = QPushButton("Export CSV")
+        self.import_btn = QPushButton("Import CSV")
+        action_layout.addWidget(self.export_btn)
+        action_layout.addWidget(self.import_btn)
 
+        left_layout = QVBoxLayout()
+        left_layout.addWidget(form_group)
+        left_layout.addLayout(btn_layout)
+        left_layout.addLayout(search_layout)
+        left_layout.addLayout(action_layout)
+        left_layout.addStretch()
+
+        # Right Panel - Table
         self.table = QTableWidget()
-        self.table.setColumnCount(4)
-        self.table.setHorizontalHeaderLabels(["ID", "Name", "Phone", "Category"])
+        self.table.setColumnCount(7)
+        self.table.setHorizontalHeaderLabels(["ID", "Name", "Phone", "Email", "Category", "Notes", "Added"])
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        header.setSectionResizeMode(5, QHeaderView.Stretch)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
-        layout.addWidget(self.table)
+        self.table.setSortingEnabled(True)
+        self.table.itemSelectionChanged.connect(self.onRowSelected)
 
-        self.setLayout(layout)
+        content_layout.addLayout(left_layout, 1)
+        content_layout.addWidget(self.table, 4)
 
+        # Status Bar
+        self.status_bar = QStatusBar()
+        self.status_bar.showMessage("Ready")
+
+        main_layout.addLayout(content_layout)
+        main_layout.addWidget(self.status_bar)
+        self.setLayout(main_layout)
+
+        # Connections
         self.add_btn.clicked.connect(self.addContact)
         self.update_btn.clicked.connect(self.updateContact)
         self.delete_btn.clicked.connect(self.deleteContact)
-        self.search_btn.clicked.connect(self.searchContact)
+        self.clear_btn.clicked.connect(self.clearFields)
+        self.search_btn.clicked.connect(self.performSearch)
+        self.search_input.returnPressed.connect(self.performSearch)
         self.export_btn.clicked.connect(self.exportContacts)
         self.import_btn.clicked.connect(self.importContacts)
-        self.help_btn.clicked.connect(self.showHelp)
+        self.phone_input.textChanged.connect(self.formatPhoneHelper)
 
-    def loadContacts(self, search_term=None):
-        self.table.setRowCount(0)
-        try:
-            contacts = self.db.fetch_contacts(search_term)
-            for row_idx, (cid, name, phone, category) in enumerate(contacts):
-                self.table.insertRow(row_idx)
-                self.table.setItem(row_idx, 0, QTableWidgetItem(str(cid)))
-                self.table.setItem(row_idx, 1, QTableWidgetItem(name))
-                self.table.setItem(row_idx, 2, QTableWidgetItem(phone))
-                self.table.setItem(row_idx, 3, QTableWidgetItem(category))
-        except Exception as e:
-            QMessageBox.critical(self, "Load Error", str(e))
+        # Shortcuts
+        QShortcut(QKeySequence("Ctrl+N"), self, self.name_input.setFocus)
+        QShortcut(QKeySequence("Escape"), self, self.clearFields)
+        QShortcut(QKeySequence("Delete"), self, self.deleteContact)
 
-    def getSelectedRowData(self):
-        row = self.table.currentRow()
-        if row != -1:
-            contact_id = int(self.table.item(row, 0).text())
-            name = self.table.item(row, 1).text()
-            phone = self.table.item(row, 2).text()
-            category = self.table.item(row, 3).text()
-            return contact_id, name, phone, category
-        return None
+        self.search_input.setFocus()
 
-    def addContact(self):
-        name = self.name_input.text().strip()
-        phone = self.phone_input.text().strip()
-        category = self.category_input.currentText()
-        if name and phone:
-            try:
-                self.db.add_contact(name, phone, category)
-                self.loadContacts()
-                self.name_input.clear()
-                self.phone_input.clear()
-                QMessageBox.information(self, "Success", "Contact added.")
-            except Exception as e:
-                QMessageBox.critical(self, "Add Error", str(e))
+    def applyTheme(self):
+        if self.is_dark_mode:
+            dark_style = """
+                QWidget { background: #1e1e1e; color: #e0e0e0; font-family: Segoe UI; }
+                QGroupBox { border: 1px solid #444; border-radius: 10px; margin: 12px; padding-top: 10px; font-weight: bold; }
+                QGroupBox::title { color: #80bfff; }
+                QLineEdit, QComboBox { background: #2d2d2d; border: 1px solid #555; border-radius: 6px; padding: 8px; }
+                QPushButton { background-color: #0077b6; color: white; border: none; padding: 10px; border-radius: 6px; font-weight: 600; }
+                QPushButton:hover { background-color: #0096c7; }
+                QTableWidget { background: #252526; color: #cccccc; gridline-color: #444; border: 1px solid #444; }
+                QHeaderView::section { background: #0077b6; color: white; padding: 12px; font-weight: bold; }
+                QStatusBar { background: #2d2d2d; color: #aaa; }
+            """
+            self.setStyleSheet(dark_style)
         else:
-            QMessageBox.warning(self, "Input Error", "Name and phone number are required.")
+            self.setStyleSheet("")
 
-    def updateContact(self):
-        data = self.getSelectedRowData()
-        if data:
-            contact_id, name, phone, category = data
-            new_name, ok1 = QInputDialog.getText(self, "Update", "Name:", text=name)
-            if ok1:
-                new_phone, ok2 = QInputDialog.getText(self, "Update", "Phone:", text=phone)
-                if ok2:
-                    new_category, ok3 = QInputDialog.getText(self, "Update", "Category:", text=category)
-                    if ok3:
-                        try:
-                            self.db.update_contact(contact_id, new_name, new_phone, new_category)
-                            self.loadContacts()
-                            QMessageBox.information(self, "Updated", "Contact updated.")
-                        except Exception as e:
-                            QMessageBox.critical(self, "Update Error", str(e))
-        else:
-            QMessageBox.warning(self, "No Selection", "Select a contact to update.")
+    def toggleTheme(self, checked):
+        self.is_dark_mode = checked
+        self.settings.setValue("dark_mode", checked)
+        self.applyTheme()
 
-    def deleteContact(self):
-        data = self.getSelectedRowData()
-        if data:
-            contact_id, name, *_ = data
-            confirm = QMessageBox.question(self, "Delete", f"Delete '{name}'?", QMessageBox.Yes | QMessageBox.No)
-            if confirm == QMessageBox.Yes:
-                try:
-                    self.db.delete_contact(contact_id)
-                    self.loadContacts()
-                    QMessageBox.information(self, "Deleted", "Contact deleted.")
-                except Exception as e:
-                    QMessageBox.critical(self, "Delete Error", str(e))
-        else:
-            QMessageBox.warning(self, "No Selection", "Select a contact to delete.")
-
-    def searchContact(self):
-        query, ok = QInputDialog.getText(self, "Search", "Enter keyword:")
-        if ok and query:
-            self.loadContacts(query)
-
-    def exportContacts(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Export Contacts", "contacts.csv", "CSV Files (*.csv)")
-        if path:
-            try:
-                with open(path, 'w', newline='', encoding='utf-8') as f:
-                    writer = csv.writer(f)
-                    writer.writerow(['ID', 'Name', 'Phone', 'Category'])
-                    for cid, name, phone, category in self.db.fetch_contacts():
-                        writer.writerow([cid, name, phone, category])
-                QMessageBox.information(self, "Export", "Contacts exported.")
-            except Exception as e:
-                QMessageBox.critical(self, "Export Error", str(e))
-
-    def importContacts(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Import Contacts", "", "CSV Files (*.csv)")
-        if path:
-            try:
-                with open(path, 'r', newline='', encoding='utf-8') as f:
-                    reader = csv.reader(f)
-                    next(reader)
-                    for row in reader:
-                        if len(row) >= 3:
-                            name, phone, category = row[1], row[2], row[3] if len(row) > 3 else "Other"
-                            self.db.add_contact(name, phone, category)
-                    self.loadContacts()
-                QMessageBox.information(self, "Import", "Contacts imported.")
-            except Exception as e:
-                QMessageBox.critical(self, "Import Error", str(e))
-
-    def showHelp(self):
-        QMessageBox.information(self, "Help", (
-            "- Add: Enter name, phone, category and click Add.\n"
-            "- Update: Select a contact and click Update.\n"
-            "- Delete: Select a contact and click Delete.\n"
-            "- Search: Click Search to find contacts.\n"
-            "- Export: Save contacts to CSV.\n"
-            "- Import: Load contacts from CSV."
+    def updateStatus(self, message):
+        self.status_bar.showMessage(message)
+        QTimer.singleShot(6000, lambda: self.status_bar.showMessage(
+            f"{self.table.rowCount()} contacts • {QDateTime.currentDateTime().toString('MMM d, yyyy h:mm AP')}"
         ))
 
+    def formatPhoneHelper(self, text):
+        digits = re.sub(r'\D', '', text)
+        if not digits:
+            return
+        if len(digits) >= 10:
+            formatted = f"({digits[:3]}) {digits[3:6]}-{digits[6:10]}"
+            if len(digits) > 10:
+                formatted = f"+{digits[:2]} {formatted}"
+            if self.phone_input.text() != formatted:
+                cursor_pos = self.phone_input.cursorPosition()
+                self.phone_input.blockSignals(True)
+                self.phone_input.setText(formatted)
+                self.phone_input.blockSignals(False)
+                self.phone_input.setCursorPosition(cursor_pos)
+
+    def loadContacts(self, search_term=None):
+        try:
+            contacts = self.db.fetch_contacts(search_term)
+            self.table.setRowCount(0)
+            for cid, name, phone, category, email, notes, created in contacts:
+                row = self.table.rowCount()
+                self.table.insertRow(row)
+                self.table.setItem(row, 0, QTableWidgetItem(str(cid)))
+                self.table.setItem(row, 1, QTableWidgetItem(name or ""))
+                self.table.setItem(row, 2, QTableWidgetItem(phone or ""))
+                self.table.setItem(row, 3, QTableWidgetItem(email or ""))
+                self.table.setItem(row, 4, QTableWidgetItem(category or "Other"))
+                self.table.setItem(row, 5, QTableWidgetItem(notes or ""))
+                created_str = created.strftime("%b %d, %Y") if created else ""
+                self.table.setItem(row, 6, QTableWidgetItem(created_str))
+            self.updateStatus(f"Loaded {len(contacts)} contacts")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load contacts:\n{e}")
+
+    def onRowSelected(self):
+        row = self.table.currentRow()
+        if row >= 0:
+            self.selected_id = int(self.table.item(row, 0).text())
+            self.name_input.setText(self.table.item(row, 1).text())
+            self.phone_input.setText(self.table.item(row, 2).text())
+            self.email_input.setText(self.table.item(row, 3).text() or "")
+            cat = self.table.item(row, 4).text()
+            idx = self.category_combo.findText(cat)
+            if idx >= 0:
+                self.category_combo.setCurrentIndex(idx)
+            self.notes_input.setText(self.table.item(row, 5).text() or "")
+
+    def validateInput(self):
+        name = self.name_input.text().strip()
+        phone_digits = re.sub(r'\D', '', self.phone_input.text())
+        email = self.email_input.text().strip()
+
+        if not name:
+            QMessageBox.warning(self, "Required", "Name is required.")
+            return False
+        if len(phone_digits) < 10:
+            QMessageBox.warning(self, "Invalid Phone", "Phone must have at least 10 digits.")
+            return False
+        if email and "@" not in email and "." not in email:
+            QMessageBox.warning(self, "Invalid Email", "Please enter a valid email address.")
+            return False
+        return True
+
+    def addContact(self):
+        if not self.validateInput(): return
+        name = self.name_input.text().strip()
+        phone = re.sub(r'\D', '', self.phone_input.text())
+        category = self.category_combo.currentText()
+        email = self.email_input.text().strip()
+        notes = self.notes_input.text().strip()
+
+        if not self.db.add_contact(name, phone, category, email, notes):
+            QMessageBox.warning(self, "Duplicate", "A contact with this phone number already exists.")
+            return
+
+        self.clearFields()
+        self.loadContacts()
+        self.updateStatus("Contact added successfully")
+
+    def updateContact(self):
+        if not self.selected_id or not self.validateInput(): return
+
+        name = self.name_input.text().strip()
+        phone = re.sub(r'\D', '', self.phone_input.text())
+        category = self.category_combo.currentText()
+        email = self.email_input.text().strip()
+        notes = self.notes_input.text().strip()
+
+        if not self.db.update_contact(self.selected_id, name, phone, category, email, notes):
+            QMessageBox.warning(self, "Duplicate", "Phone number already in use by another contact.")
+            return
+
+        self.clearFields()
+        self.loadContacts()
+        self.updateStatus("Contact updated successfully")
+
+    def deleteContact(self):
+        if not self.selected_id: return
+        name = self.name_input.text().strip() or "this contact"
+        if QMessageBox.question(self, "Confirm Delete",
+                                f"Permanently delete contact?\n\n{name}",
+                                QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
+            self.db.delete_contact(self.selected_id)
+            self.clearFields()
+            self.loadContacts()
+            self.updateStatus("Contact deleted")
+
+    def clearFields(self):
+        self.name_input.clear()
+        self.phone_input.clear()
+        self.email_input.clear()
+        self.notes_input.clear()
+        self.category_combo.setCurrentIndex(0)
+        self.selected_id = None
+        self.table.clearSelection()
+
+    def performSearch(self):
+        term = self.search_input.text().strip()
+        self.loadContacts(term if term else None)
+
+    def exportContacts(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Contacts",
+            str(Path.home() / f"contacts_{datetime.now():%Y%m%d_%H%M%S}.csv"),
+            "CSV Files (*.csv)"
+        )
+        if not path: return
+        try:
+            contacts = self.db.fetch_contacts()
+            with open(path, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(['ID', 'Name', 'Phone', 'Email', 'Category', 'Notes', 'Created'])
+                writer.writerows(contacts)
+            self.updateStatus(f"Exported {len(contacts)} contacts")
+            QMessageBox.information(self, "Success", f"Exported successfully:\n{path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Export failed:\n{e}")
+
+    def importContacts(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Import CSV", "", "CSV Files (*.csv)")
+        if not path: return
+
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                reader = csv.reader(f)
+                next(reader, None)
+                rows = [r for r in reader if len(r) >= 2 and r[1].strip()]
+
+            if not rows:
+                QMessageBox.information(self, "Import", "No valid data found.")
+                return
+
+            progress = QProgressDialog("Importing contacts...", "Cancel", 0, len(rows), self)
+            progress.setWindowModality(Qt.WindowModal)
+            imported = skipped = 0
+
+            for i, row in enumerate(rows):
+                if progress.wasCanceled(): break
+                name = row[1].strip()
+                phone = re.sub(r'\D', '', row[2]) if len(row) > 2 else ""
+                category = row[4].strip() if len(row) > 4 else "Other"
+                email = row[3].strip() if len(row) > 3 else ""
+                notes = row[5].strip() if len(row) > 5 else ""
+
+                if len(phone) >= 10:
+                    if self.db.add_contact(name, phone, category, email, notes):
+                        imported += 1
+                    else:
+                        skipped += 1
+                progress.setValue(i + 1)
+
+            self.loadContacts()
+            self.updateStatus(f"Imported {imported}, skipped {skipped} duplicates")
+            QMessageBox.information(self, "Complete", f"Imported: {imported}\nSkipped (duplicates): {skipped}")
+        except Exception as e:
+            QMessageBox.critical(self, "Import Failed", f"Error: {e}")
+
+    def backupDatabase(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Backup Database",
+            str(Path.home() / f"contactbook_backup_{datetime.now():%Y%m%d_%H%M%S}.sql"),
+            "SQL Files (*.sql)"
+        )
+        if not path: return
+
+        user = os.getenv("DB_USER", "root")
+        password = os.getenv("DB_PASSWORD", "password")
+        cmd = ["mysqldump", "-u", user, f"-p{password}", "contactbook"]
+
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                result = subprocess.run(cmd, stdout=f, stderr=subprocess.PIPE, text=True)
+            if result.returncode == 0:
+                QMessageBox.information(self, "Success", f"Backup created:\n{path}")
+                self.updateStatus("Database backup created")
+            else:
+                QMessageBox.critical(self, "Backup Failed", f"Error:\n{result.stderr}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Backup failed:\n{e}")
+
+    def showStatistics(self):
+        total, by_cat = self.db.get_statistics()
+        msg = f"<h3>Statistics</h3><b>Total:</b> {total}<br><br><b>By Category:</b><ul>"
+        for cat, count in sorted(by_cat.items()):
+            msg += f"<li><b>{cat}:</b> {count}</li>"
+        msg += "</ul>"
+        QMessageBox.information(self, "Contact Statistics", msg or "No contacts yet.")
+
+    def clearAllContacts(self):
+        if QMessageBox.question(self, "Warning", "Delete ALL contacts permanently?", QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+            return
+        text, ok = QInputDialog.getText(self, "Confirm Deletion", "Type DELETE ALL to confirm:")
+        if ok and text.strip().upper() == "DELETE ALL":
+            try:
+                self.db.truncate_table()
+                self.loadContacts()
+                self.updateStatus("All contacts deleted")
+                QMessageBox.warning(self, "Cleared", "All contacts have been permanently removed.")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to clear database:\n{e}")
+
+    def showAbout(self):
+        QMessageBox.about(self, "About", 
+            "<h2>Contact Manager Pro v2.1</h2>"
+            "<p>Professional desktop contact management</p>"
+            "<p>© 2025 MyCompany • Fully Open Source Friendly</p>")
+
+    def showHelp(self):
+        QMessageBox.information(self, "Help", 
+            "<h3>Shortcuts</h3><ul>"
+            "<li><b>Ctrl+N</b>: New contact</li>"
+            "<li><b>Escape</b>: Clear form</li>"
+            "<li><b>Delete</b>: Remove selected</li>"
+            "<li>Double-click row to edit</li>"
+            "</ul><p>Phone numbers are auto-formatted.</p>")
+
     def closeEvent(self, event):
-        self.db.close()
+        self.settings.setValue("geometry", self.saveGeometry())
+        if self.db:
+            self.db.close()
         event.accept()
 
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    app.setApplicationName("Contact Manager Pro")
+    app.setOrganizationName("MyCompany")
     window = ContactBookUI()
     window.show()
     sys.exit(app.exec_())
